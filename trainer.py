@@ -1,21 +1,19 @@
 import copy
 import time
+
+import ray
 import torch
-from torch.multiprocessing import Process
-from torch.nn.utils.rnn import pad_sequence
 
 import models
-import replay_buffer
+from torch.nn.utils.rnn import pad_sequence
 
-
-class Trainer(Process):
-    def __init__(self, initial_checkpoint, config, shared_dict):
-        super().__init__(daemon=True)
+@ray.remote(num_gpus=0.5)
+class Trainer:
+    def __init__(self, initial_checkpoint, config, device):
         self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = models.SuZeroNetwork(*config.net_config)
-        self.model.set_weights(copy.deepcopy(shared_dict["weights"]))
-        self.model.to(self.device)
+        self.model.set_weights(copy.deepcopy(initial_checkpoint["weights"]))
+        self.model.to(device)
         self.model.train()
         self.training_step = initial_checkpoint["training_step"]
         self.optimizer = torch.optim.Adam(
@@ -28,11 +26,6 @@ class Trainer(Process):
             self.optimizer.load_state_dict(
                 copy.deepcopy(initial_checkpoint["optimizer_state"])
             )
-        self.shared_dict = shared_dict
-
-    def run(self):
-        print('加载了一个trainer')
-        self.continuous_update_weights(self.shared_dict)
 
     def update_weights(self, batch):
         (
@@ -50,15 +43,16 @@ class Trainer(Process):
         ).to(device)
         observation_batch = ob_.float().to(device)
         action_batch = [torch.tensor(each) for each in action_batch]
-        action_batch = pad_sequence(action_batch, batch_first=True).float().to(device)
+        ac = pad_sequence(action_batch, batch_first=True)
+        action_key_padding_mask = torch.tensor(
+            [[False if i < len(each) else True for i in range(ac.size(1))] for each in action_batch]
+        ).to(device)
+        action_batch = ac.float().to(device)
         target_value = torch.tensor(target_value).float().to(device)
         target_policy = [torch.tensor(each).float().to(device) for each in target_policy]
-        policy_mask = [torch.zeros_like(each, dtype=torch.float, device=device) for each in target_policy]
         target_policy = pad_sequence(target_policy, batch_first=True)
-        policy_mask = pad_sequence(policy_mask, batch_first=True, padding_value=1)
         hidden_state = self.model.representation(observation_batch, key_padding_mask)
-        value, policy_logits = self.model.prediction(hidden_state, action_batch)
-        # policy_logits.data.masked_fill_(policy_mask.bool(), -float('inf'))
+        value, policy_logits = self.model.prediction(hidden_state, action_batch, action_key_padding_mask)
         value_loss, policy_loss = self.loss_function(
             value,
             policy_logits,
@@ -66,13 +60,12 @@ class Trainer(Process):
             target_policy
         )
 
-        loss = value_loss + policy_loss * self.config.policy_loss_weight
+        loss = value_loss + policy_loss
         loss = loss.mean()
 
         # Optimize
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=20, norm_type=2)
         self.optimizer.step()
         self.training_step += 1
 
@@ -82,34 +75,41 @@ class Trainer(Process):
             policy_loss.mean().item()
         )
 
-    def continuous_update_weights(self, shared_dict):
+    def continuous_update_weights(self, replay_buffer, shared_storage):
         # Wait for the replay buffer to be filled
-        while shared_dict['checkpoint']["num_played_games"] < 1:
-            time.sleep(1)
-        next_batch = replay_buffer.get_batch(shared_dict, self.config)
+        while ray.get(shared_storage.get_info.remote("num_played_games")) < 1:
+            time.sleep(0.1)
+        next_batch = replay_buffer.get_batch.remote()
         # Training loop
         while self.training_step < self.config.training_steps:
-            index_batch, batch = next_batch
-            next_batch = replay_buffer.get_batch(shared_dict, self.config)
+            index_batch, batch = ray.get(next_batch)
+            next_batch = replay_buffer.get_batch.remote()
             self.update_lr()
             loss, value_loss, policy_loss = self.update_weights(batch)
-            print('进行了一次训练')
-            checkpoint = shared_dict['checkpoint']
             if self.training_step % self.config.checkpoint_interval == 0:
-                shared_dict["weights"] = copy.deepcopy(self.model.get_weights())
-                checkpoint["optimizer_state"] = copy.deepcopy(models.dict_to_cpu(self.optimizer.state_dict()))
-            checkpoint["training_step"] = self.training_step
-            checkpoint["lr"] = self.optimizer.param_groups[0]["lr"]
-            checkpoint["loss"] = loss
-            checkpoint["value_loss"] = value_loss
-            checkpoint["policy_loss"] = policy_loss
-            shared_dict['checkpoint'] = checkpoint
-
+                shared_storage.set_info.remote(
+                    {
+                        "weights": copy.deepcopy(self.model.get_weights()),
+                        "optimizer_state": copy.deepcopy(self.optimizer.state_dict())
+                    }
+                )
+            shared_storage.set_info.remote(
+                {
+                    "training_step": self.training_step,
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "loss": loss,
+                    "value_loss": value_loss,
+                    "policy_loss": policy_loss
+                }
+            )
             if self.config.ratio:
                 while (
                         self.training_step
-                        / max(1, shared_dict['checkpoint']["num_played_steps"])
-                ) > self.config.ratio and self.training_step < self.config.training_steps:
+                        / max(1, ray.get(shared_storage.get_info.remote("num_played_steps"))
+                              )
+                        > self.config.ratio
+                        and self.training_step < self.config.training_steps
+                ):
                     time.sleep(0.5)
 
     def update_lr(self):
@@ -127,13 +127,6 @@ class Trainer(Process):
             target_policy
     ):
         target_value = torch.unsqueeze(target_value, dim=1)
-        target_value.clamp_(min=-0.999, max=0.999)
-        value.clamp_(min=-0.999, max=0.999)
-        target_value = (target_value + 1) / 2
-        value = (value + 1) / 2
-        BCEloss = torch.nn.BCELoss(reduction='none')
-        value_loss = BCEloss(value, target_value).sum(1)
-        value_loss = value_loss - BCEloss(target_value, target_value).sum(1)
-        policy_loss = (- target_policy * torch.nn.LogSoftmax(dim=1)(policy_logits)).sum(1)
-        policy_loss = policy_loss + (target_policy * torch.nn.LogSoftmax(dim=1)(target_policy)).sum(1)
+        value_loss = (torch.square(target_value - value)).sum(1)
+        policy_loss = (torch.square(target_policy - policy_logits)).sum(1)
         return value_loss, policy_loss

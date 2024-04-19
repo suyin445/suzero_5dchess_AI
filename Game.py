@@ -14,9 +14,9 @@ class Game:
         done = self.game.end
         if done:
             if self.game.winner == self.game.turn + 2:
-                reward = 1
+                reward = 2
             elif self.game.winner == 1:
-                reward = 0
+                reward = 1
             else:
                 reward = -1
         return self.get_observation(), reward, done

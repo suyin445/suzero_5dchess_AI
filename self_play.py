@@ -1,17 +1,15 @@
 import torch
 import numpy
 import math
+import ray
 import copy
 import time
-from torch.multiprocessing import Process
 
 import models
-import replay_buffer
-
 
 class Node:
     def __init__(self, prior):
-        self.visit_count = 0
+        self.visit_count = 1
         self.to_play = -1
         self.prior = prior.item() if isinstance(prior, torch.Tensor) else prior
         self.value_sum = 0
@@ -44,7 +42,7 @@ class MCTS:
     def __init__(self, config):
         self.config = config
 
-    def run(self, model, game_state, root_node=None):
+    def run(self, model, game_state, root_node = None):
         device = next(model.parameters()).device
         if not root_node:
             root = Node(0)
@@ -53,7 +51,6 @@ class MCTS:
             observation = torch.tensor(observation).float().unsqueeze(0).to(device)
             hidden_state = model.representation(observation)
             actions = game_state.get_all_legal()
-            num_legal = len(actions)
             action_tensor = torch.unsqueeze(torch.tensor(actions, dtype=torch.float, device=device), dim=0)
             value, policy_logits = model.prediction_network(hidden_state, action_tensor)
             root.expand(actions, game_state.to_play(), 0, torch.squeeze(policy_logits, dim=0).cpu(), game_state)
@@ -66,19 +63,12 @@ class MCTS:
                 observation = torch.tensor(observation).float().unsqueeze(0).to(device)
                 hidden_state = model.representation(observation)
                 actions = game_state.get_all_legal()
-                num_legal = len(actions)
                 action_tensor = torch.unsqueeze(torch.tensor(actions, dtype=torch.float, device=device), dim=0)
                 value, policy_logits = model.prediction_network(hidden_state, action_tensor)
                 root.expand(actions, game_state.to_play(), 0, torch.squeeze(policy_logits, dim=0).cpu(), game_state)
-            else:
-                num_legal = len(list(root.children.keys()))
         min_max_stats = MinMaxStats()
         max_tree_depth = 0
-        now_num_simulations = max(self.config.num_simulations, int(num_legal / self.config.simulations_ratio))
-        now_num_simulations = min(now_num_simulations, self.config.max_simulations)
-        print('现在蒙树数为: ', now_num_simulations)
-        print('现在合法步为: ', num_legal)
-        for _ in range(now_num_simulations):
+        for _ in range(self.config.num_simulations):
             node = root
             search_path = [node]
             current_tree_depth = 0
@@ -109,8 +99,8 @@ class MCTS:
             min_max_stats.update(node.reward + self.config.discount * -node.value())
 
             value = (
-                        -node.reward if node.to_play == to_play else node.reward
-                    ) + self.config.discount * value
+                -node.reward if node.to_play == to_play else node.reward
+            ) + self.config.discount * value
 
     def select_child(self, node, min_max_stats):
         ucb = numpy.array([self.ucb_score(node, child, min_max_stats) for action, child in node.children.items()])
@@ -123,20 +113,18 @@ class MCTS:
 
     def ucb_score(self, parent, child, min_max_stats):
         pb_c = math.log(
-            (parent.visit_count + self.config.pb_c_base + 1) / self.config.pb_c_base
-        ) + self.config.pb_c_init
+                (parent.visit_count + self.config.pb_c_base + 1) / self.config.pb_c_base
+            ) + self.config.pb_c_init
         pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
 
         prior_score = pb_c * child.prior
 
         if child.visit_count > 0:
-            value_score = child.reward
-            if child.to_play != -1:
-                if child.to_play == parent.to_play:
-                    value_score += self.config.discount * child.value()
-                else:
-                    value_score -= self.config.discount * child.value()
-            value_score = min_max_stats.normalize(value_score)
+            value_score = min_max_stats.normalize(
+                child.reward
+                + self.config.discount
+                * (-child.value())
+            )
         else:
             value_score = 0
 
@@ -178,9 +166,9 @@ class GameHistory:
             sum_visits = sum(child.visit_count for child in root.children.values())
             action_space = list(root.children.keys())
             complete_child_visits = numpy.array([
-                root.children[a].visit_count / sum_visits
-                for a in action_space
-            ])
+                    root.children[a].visit_count / sum_visits
+                    for a in action_space
+                ])
             self.child_visits.append(complete_child_visits)
 
             self.legal_history.append(action_space)
@@ -195,42 +183,48 @@ class GameHistory:
         return stacked_observations
 
 
-class Selfplay(Process):
-    def __init__(self, Game, config, shared_dict, id_):
-        super().__init__(daemon=True)
+@ray.remote
+class Selfplay:
+    def __init__(self, initial_checkpoint, Game, config):
         self.config = config
         self.game = Game()
         self.model = models.SuZeroNetwork(*self.config.net_config)
-        self.model.set_weights(shared_dict["weights"])
+        self.model.set_weights(initial_checkpoint["weights"])
         self.model.to(torch.device("cuda" if self.config.selfplay_on_gpu else "cpu"))
         self.model.eval()
-        self.shared_dict = shared_dict
-        self.id_ = id_
 
-    def run(self):
-        self.continuous_self_play(self.shared_dict)
-
-    def continuous_self_play(self, shared_dict):
-        while shared_dict['checkpoint']["training_step"] < self.config.training_steps:
-            self.model.set_weights(shared_dict["weights"])
+    def continuous_self_play(self, shared_storage, replay_buffer):
+        while ray.get(
+                shared_storage.get_info.remote("training_step")
+        ) < self.config.training_steps:
+            self.model.set_weights(ray.get(shared_storage.get_info.remote("weights")))
             game_history = self.play_game()
 
-            checkpoint = shared_dict['checkpoint']
-            checkpoint["episode_length"] = len(game_history.action_history) - 1
-            checkpoint["total_reward"] = sum(game_history.reward_history)
-            checkpoint["mean_value"] = numpy.mean(
+            shared_storage.set_info.remote(
+                {
+                    "episode_length": len(game_history.action_history) - 1,
+                    "total_reward": sum(game_history.reward_history),
+                    "mean_value": numpy.mean(
                         [value for value in game_history.root_values if value]
-                    )
-            shared_dict['checkpoint'] = checkpoint
+                    ),
+                }
+            )
 
-            replay_buffer.save_game(shared_dict, game_history, self.config)
-            print('进行了一次selfplay, id:', self.id_)
+            replay_buffer.save_game.remote(game_history, shared_storage)
+            for each in game_history.action_history:
+                print(each)
+            print('进行了一次selfplay')
 
             if self.config.ratio:
-                while (shared_dict['checkpoint']["num_played_steps"]
-                        / max(1, shared_dict['checkpoint']["training_step"])
-                        > self.config.ratio) and \
-                        shared_dict['checkpoint']["training_step"] < self.config.training_steps:
+                while (
+                    ray.get(shared_storage.get_info.remote("training_step"))
+                    / max(
+                        1, ray.get(shared_storage.get_info.remote("num_played_steps"))
+                    )
+                    < self.config.ratio
+                    and ray.get(shared_storage.get_info.remote("training_step"))
+                    < self.config.training_steps
+                ):
                     time.sleep(0.5)
 
     def play_game(self):
@@ -258,7 +252,7 @@ class Selfplay(Process):
                 action = self.select_action(root)
                 next_node = root.children[action]
                 observation, reward, done = game_state.step(action)
-                print('进行了一步', action, ' id:', self.id_)
+                print('进行了一步', numpy.random.randint(low=0, high=100, size=1))
                 game_state_list.append(copy.deepcopy(game_state))
                 game_history.store_search_statistics(root)
                 game_history.action_history.append(action)

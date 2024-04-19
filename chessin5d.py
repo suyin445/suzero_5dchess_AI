@@ -773,8 +773,6 @@ class State:
         return False
 
     def get_all_legal(self):
-        if self.end:
-            return [[8, 8, 8, 8, 8, 8, 8, 8]]
         action_list = [[0, -1, -1, 0, 0, 0, 0, 0]]
         if self.end_turn:
             action_list.append([0, -1, 1, 0, 0, 0, 0, 0])
